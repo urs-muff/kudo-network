@@ -145,9 +145,9 @@ type PeerMessage struct {
 
 var (
 	ipfs       Node_i
-	conceptMap map[GUID]Concept_i
+	conceptMap ConceptMap
 	conceptMu  sync.RWMutex
-	peerMap    map[PeerID]Peer_i
+	peerMap    PeerMap
 	peerMapMu  sync.RWMutex
 	ownerGUID  GUID
 	ownerMu    sync.RWMutex
@@ -157,6 +157,44 @@ var (
 		},
 	}
 )
+
+type ConceptMap map[GUID]Concept_i
+
+func (cm *ConceptMap) UnmarshalJSON(data []byte) error {
+	var rawMap map[GUID]json.RawMessage
+	if err := json.Unmarshal(data, &rawMap); err != nil {
+		return err
+	}
+
+	*cm = make(ConceptMap)
+	for guid, raw := range rawMap {
+		var c Concept
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return err
+		}
+		(*cm)[guid] = &c
+	}
+	return nil
+}
+
+type PeerMap map[PeerID]Peer_i
+
+func (pm *PeerMap) UnmarshalJSON(data []byte) error {
+	var rawMap map[PeerID]json.RawMessage
+	if err := json.Unmarshal(data, &rawMap); err != nil {
+		return err
+	}
+
+	*pm = make(PeerMap)
+	for peerID, raw := range rawMap {
+		var p Peer
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return err
+		}
+		(*pm)[peerID] = &p
+	}
+	return nil
+}
 
 func main() {
 	ipfs = NewIPFSShell("localhost:5001")
@@ -180,8 +218,8 @@ func main() {
 }
 
 func initializeLists(ctx context.Context) {
-	conceptMap = make(map[GUID]Concept_i)
-	peerMap = make(map[PeerID]Peer_i)
+	conceptMap = make(ConceptMap)
+	peerMap = make(PeerMap)
 
 	if err := ipfs.Bootstrap(ctx); err != nil {
 		log.Fatalf("Failed to bootstrap IPFS: %v", err)
