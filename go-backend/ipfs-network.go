@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -21,6 +22,9 @@ const (
 	pubsubTopic       = "concept-list"
 	publishInterval   = 1 * time.Minute
 	peerCheckInterval = 5 * time.Minute
+	conceptListCID    = "concept-list-cid"
+	peerListCID       = "peer-list-cid"
+	ownerGUIDCID      = "owner-guid-cid"
 )
 
 // IPFSShell implements the Node_i interface using go-ipfs-api
@@ -97,7 +101,7 @@ func (i *IPFSShell) ListPeers(ctx context.Context) ([]Peer_i, error) {
 
 	peers := make([]Peer_i, len(swarmPeers.Peers))
 	for j, p := range swarmPeers.Peers {
-		peers[j] = &ConcretePeer{
+		peers[j] = &Peer{
 			ID:        PeerID(p.Peer),
 			Timestamp: time.Now(),
 		}
@@ -133,13 +137,21 @@ func (i *IPFSShell) ID(ctx context.Context) (PeerID, error) {
 	return PeerID(info.ID), nil
 }
 
+type PeerMessage struct {
+	PeerID    PeerID `json:"peerId"`
+	OwnerGUID GUID   `json:"ownerGuid"`
+	CIDs      []CID  `json:"cids"`
+}
+
 var (
-	ipfs        Node_i
-	conceptList []Concept_i
-	conceptMu   sync.RWMutex
-	peerList    map[PeerID]Peer_i
-	peerListMu  sync.RWMutex
-	upgrader    = websocket.Upgrader{
+	ipfs       Node_i
+	conceptMap map[GUID]Concept_i
+	conceptMu  sync.RWMutex
+	peerMap    map[PeerID]Peer_i
+	peerMapMu  sync.RWMutex
+	ownerGUID  GUID
+	ownerMu    sync.RWMutex
+	upgrader   = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true // Allow all origins for this example
 		},
@@ -152,21 +164,96 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Bootstrap the IPFS node
-	if err := ipfs.Bootstrap(ctx); err != nil {
-		log.Fatalf("Failed to bootstrap IPFS: %v", err)
-	}
+	initializeLists(ctx)
+	loadOwnerGUID(ctx)
 
 	// Start IPFS routines
-	go publishRoutine(ctx)
-	go peerDiscoveryRoutine(ctx)
+	go runPeriodicTask(ctx, publishInterval, publishPeerMessage)
+	go runPeriodicTask(ctx, peerCheckInterval, discoverPeers)
 	go subscribeRoutine(ctx)
 
 	// Set up Gin router
 	r := gin.Default()
+	setupRoutes(r)
 
-	// CORS middleware
-	r.Use(func(c *gin.Context) {
+	// Start server
+	log.Fatal(r.Run(":9090"))
+}
+
+func initializeLists(ctx context.Context) {
+	conceptMap = make(map[GUID]Concept_i)
+	peerMap = make(map[PeerID]Peer_i)
+
+	if err := ipfs.Bootstrap(ctx); err != nil {
+		log.Fatalf("Failed to bootstrap IPFS: %v", err)
+	}
+
+	loadFromIPFS(ctx, CID(conceptListCID), &conceptMap)
+	loadFromIPFS(ctx, CID(peerListCID), &peerMap)
+}
+
+func loadOwnerGUID(ctx context.Context) {
+	data, err := ipfs.Get(ctx, CID(ownerGUIDCID))
+	if err != nil {
+		log.Printf("Failed to load owner GUID from IPFS: %v", err)
+		log.Println("Generating new owner GUID...")
+		ownerMu.Lock()
+		ownerGUID = GUID(uuid.New().String())
+		ownerMu.Unlock()
+		if err := saveOwnerGUID(ctx); err != nil {
+			log.Printf("Failed to save new owner GUID: %v", err)
+		}
+		return
+	}
+	defer data.Close()
+
+	var guid GUID
+	if err := json.NewDecoder(data).Decode(&guid); err != nil {
+		log.Printf("Failed to decode owner GUID: %v", err)
+		return
+	}
+
+	ownerMu.Lock()
+	ownerGUID = guid
+	ownerMu.Unlock()
+
+	log.Printf("Loaded owner GUID from IPFS: %s", ownerGUID)
+}
+
+func saveOwnerGUID(ctx context.Context) error {
+	ownerMu.RLock()
+	guid := ownerGUID
+	ownerMu.RUnlock()
+
+	data, err := json.Marshal(guid)
+	if err != nil {
+		return fmt.Errorf("failed to marshal owner GUID: %v", err)
+	}
+
+	cid, err := ipfs.Add(ctx, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("failed to save owner GUID to IPFS: %v", err)
+	}
+
+	log.Printf("Saved owner GUID to IPFS with CID: %s", cid)
+	return nil
+}
+
+func setupRoutes(r *gin.Engine) {
+	r.Use(corsMiddleware())
+	r.POST("/concept", addConcept)
+	r.GET("/concept/:guid", getConcept)
+	r.POST("/owner", updateOwner)
+	r.GET("/owner", getOwner)
+	r.DELETE("/concept/:guid", deleteConcept)
+	r.GET("/concepts", queryConcepts)
+	r.GET("/peers", listPeers)
+	r.GET("/ws", handleWebSocket)
+	r.GET("/ws/peers", handlePeerWebSocket)
+}
+
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
@@ -175,15 +262,113 @@ func main() {
 			return
 		}
 		c.Next()
-	})
+	}
+}
 
-	// Routes
-	r.POST("/concept", addConcept)
-	r.GET("/ws", handleWebSocket)
-	r.GET("/ws/peers", handlePeerWebSocket)
+func loadFromIPFS(ctx context.Context, cid CID, target interface{}) {
+	data, err := ipfs.Get(ctx, cid)
+	if err != nil {
+		log.Printf("Failed to load data from IPFS (CID: %s): %v", cid, err)
+		return
+	}
+	defer data.Close()
 
-	// Start server
-	log.Fatal(r.Run(":9090"))
+	if err := json.NewDecoder(data).Decode(target); err != nil {
+		log.Printf("Failed to decode data from IPFS (CID: %s): %v", cid, err)
+		return
+	}
+
+	log.Printf("Loaded data from IPFS (CID: %s)", cid)
+}
+
+func saveToIPFS(ctx context.Context, data interface{}) (CID, error) {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal data: %v", err)
+	}
+
+	cid, err := ipfs.Add(ctx, strings.NewReader(string(jsonData)))
+	if err != nil {
+		return "", fmt.Errorf("failed to save data to IPFS: %v", err)
+	}
+
+	log.Printf("Saved data to IPFS with CID: %s", cid)
+	return cid, nil
+}
+
+func runPeriodicTask(ctx context.Context, interval time.Duration, task func(context.Context)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			task(ctx)
+		}
+	}
+}
+
+func updateOwner(c *gin.Context) {
+	var ownerConcept Concept
+	if err := c.BindJSON(&ownerConcept); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid owner data"})
+		return
+	}
+
+	ownerConcept.Type = "Owner"
+	ownerMu.RLock()
+	ownerConcept.Guid = ownerGUID
+	ownerMu.RUnlock()
+	ownerConcept.Timestamp = time.Now()
+
+	peerID, err := ipfs.ID(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get peer ID"})
+		return
+	}
+
+	addOrUpdateConcept(&ownerConcept)
+
+	peerMapMu.Lock()
+	peerMap[peerID] = &Peer{
+		ID:        peerID,
+		OwnerGUID: ownerConcept.Guid,
+		Timestamp: time.Now(),
+	}
+	peerMapMu.Unlock()
+
+	saveToIPFS(context.Background(), peerMap)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Owner updated successfully", "guid": ownerConcept.Guid})
+}
+
+func addOrUpdateConcept(concept Concept_i) {
+	conceptMu.Lock()
+	defer conceptMu.Unlock()
+
+	conceptMap[concept.GetGUID()] = concept
+	log.Printf("Added/Updated concept: GUID=%s, Name=%s", concept.GetGUID(), concept.GetName())
+
+	saveToIPFS(context.Background(), conceptMap)
+}
+
+func getOwner(c *gin.Context) {
+	ownerMu.RLock()
+	ownerGUID := ownerGUID
+	ownerMu.RUnlock()
+
+	conceptMu.RLock()
+	ownerConcept, exists := conceptMap[ownerGUID]
+	conceptMu.RUnlock()
+
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Owner not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, ownerConcept)
 }
 
 func addConcept(c *gin.Context) {
@@ -205,7 +390,7 @@ func addConcept(c *gin.Context) {
 		return
 	}
 
-	concept := &ConcreteConcept{
+	concept := &Concept{
 		Guid:        GUID(uuid.New().String()),
 		Name:        newConcept.Name,
 		Description: newConcept.Description,
@@ -217,6 +402,8 @@ func addConcept(c *gin.Context) {
 
 	addNewConcept(concept)
 
+	log.Printf("Added new concept: GUID=%s, Name=%s, CID=%s", concept.Guid, concept.Name, concept.Cid)
+
 	c.JSON(http.StatusOK, gin.H{
 		"guid": concept.Guid,
 		"cid":  string(concept.Cid),
@@ -224,149 +411,135 @@ func addConcept(c *gin.Context) {
 }
 
 func handleWebSocket(c *gin.Context) {
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		log.Printf("Failed to upgrade connection: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	// Send initial concept list
-	sendConceptList(conn)
-
-	// Start goroutine to continuously send updates
-	go func() {
-		for {
-			time.Sleep(5 * time.Second)
-			sendConceptList(conn)
-		}
-	}()
-
-	// Keep the connection alive
-	for {
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			log.Printf("WebSocket read error: %v", err)
-			break
-		}
-	}
+	handleWebSocketConnection(c, sendConceptList)
 }
 
 func handlePeerWebSocket(c *gin.Context) {
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		log.Printf("Failed to upgrade peer connection: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	// Send initial peer list
-	sendPeerList(conn)
-
-	// Start goroutine to continuously send updates
-	go func() {
-		for {
-			time.Sleep(5 * time.Second)
-			sendPeerList(conn)
-		}
-	}()
-
-	// Keep the connection alive
-	for {
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			log.Printf("Peer WebSocket read error: %v", err)
-			break
-		}
-	}
+	handleWebSocketConnection(c, sendPeerList)
 }
 
-func sendConceptList(conn *websocket.Conn) {
+func getConcept(c *gin.Context) {
+	guid := GUID(c.Param("guid"))
+
+	conceptMu.RLock()
+	concept, exists := conceptMap[guid]
+	conceptMu.RUnlock()
+
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Concept not found"})
+		return
+	}
+	c.JSON(http.StatusOK, concept)
+}
+
+func deleteConcept(c *gin.Context) {
+	guid := GUID(c.Param("guid"))
+
+	conceptMu.Lock()
+	defer conceptMu.Unlock()
+
+	if _, exists := conceptMap[guid]; !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Concept not found"})
+		return
+	}
+
+	delete(conceptMap, guid)
+	saveToIPFS(context.Background(), conceptMap)
+
+	c.Status(http.StatusNoContent)
+}
+
+func queryConcepts(c *gin.Context) {
+	filter := ConceptFilter{
+		CID:         c.Query("cid"),
+		GUID:        GUID(c.Query("guid")),
+		Name:        c.Query("name"),
+		Description: c.Query("description"),
+		Type:        c.Query("type"),
+	}
+
+	if timestamp := c.Query("timestamp"); timestamp != "" {
+		t, err := time.Parse(time.RFC3339, timestamp)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid timestamp format"})
+			return
+		}
+		filter.TimestampAfter = &t
+	}
+
+	concepts := filterConcepts(filter)
+	c.JSON(http.StatusOK, concepts)
+}
+
+func listPeers(c *gin.Context) {
+	peerMapMu.RLock()
+	defer peerMapMu.RUnlock()
+
+	filteredPeerMap := make(map[PeerID]Peer_i)
+	for peerID, peer := range peerMap {
+		if peer.GetOwnerGUID() != "" {
+			filteredPeerMap[peerID] = peer
+		}
+	}
+
+	c.JSON(http.StatusOK, filteredPeerMap)
+}
+
+type ConceptFilter struct {
+	CID            string
+	GUID           GUID
+	Name           string
+	Description    string
+	Type           string
+	TimestampAfter *time.Time
+}
+
+func filterConcepts(filter ConceptFilter) []Concept_i {
 	conceptMu.RLock()
 	defer conceptMu.RUnlock()
 
-	for _, concept := range conceptList {
-		err := conn.WriteJSON(concept)
-		if err != nil {
-			log.Printf("Failed to send concept: %v", err)
+	if isEmptyFilter(filter) {
+		concepts := make([]Concept_i, 0, len(conceptMap))
+		for _, concept := range conceptMap {
+			concepts = append(concepts, concept)
+		}
+		return concepts
+	}
+
+	var filteredConcepts []Concept_i
+	for _, concept := range conceptMap {
+		if matchesConcept(concept, filter) {
+			filteredConcepts = append(filteredConcepts, concept)
 		}
 	}
+	return filteredConcepts
 }
 
-func sendPeerList(conn *websocket.Conn) {
-	peerListMu.RLock()
-	defer peerListMu.RUnlock()
-
-	err := conn.WriteJSON(peerList)
-	if err != nil {
-		log.Printf("Failed to send peer list: %v", err)
-	}
+func isEmptyFilter(filter ConceptFilter) bool {
+	return filter.CID == "" && filter.GUID == "" && filter.Name == "" &&
+		filter.Description == "" && filter.Type == "" && filter.TimestampAfter == nil
 }
 
-func publishRoutine(ctx context.Context) {
-	ticker := time.NewTicker(publishInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			publishConceptList(ctx)
-		}
+func matchesConcept(concept Concept_i, filter ConceptFilter) bool {
+	if filter.CID != "" && string(concept.GetCID()) != filter.CID {
+		return false
 	}
-}
-
-func publishConceptList(ctx context.Context) {
-	conceptMu.RLock()
-	data, err := json.Marshal(conceptList)
-	conceptMu.RUnlock()
-
-	if err != nil {
-		log.Printf("Error marshaling concept list: %v", err)
-		return
+	if filter.GUID != "" && concept.GetGUID() != filter.GUID {
+		return false
 	}
-
-	err = ipfs.Publish(ctx, pubsubTopic, data)
-	if err != nil {
-		log.Printf("Error publishing concept list: %v", err)
-	} else {
-		log.Println("Published concept list")
+	if filter.Name != "" && !strings.Contains(strings.ToLower(concept.GetName()), strings.ToLower(filter.Name)) {
+		return false
 	}
-}
-
-func peerDiscoveryRoutine(ctx context.Context) {
-	ticker := time.NewTicker(peerCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			discoverPeers(ctx)
-		}
+	if filter.Description != "" && !strings.Contains(strings.ToLower(concept.GetDescription()), strings.ToLower(filter.Description)) {
+		return false
 	}
-}
-
-func discoverPeers(ctx context.Context) {
-	peers, err := ipfs.ListPeers(ctx)
-	if err != nil {
-		log.Printf("Error discovering peers: %v", err)
-		return
+	if filter.Type != "" && concept.GetType() != filter.Type {
+		return false
 	}
-
-	peerListMu.Lock()
-	defer peerListMu.Unlock()
-
-	for _, peer := range peers {
-		peerID := peer.GetID()
-		if _, exists := peerList[peerID]; !exists {
-			peerList[peerID] = peer
-		}
+	if filter.TimestampAfter != nil && !concept.GetTimestamp().After(*filter.TimestampAfter) {
+		return false
 	}
-
-	log.Printf("Discovered %d peers", len(peerList))
+	return true
 }
 
 func subscribeRoutine(ctx context.Context) {
@@ -381,48 +554,204 @@ func subscribeRoutine(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case data := <-ch:
-			var receivedConcepts []ConcreteConcept
-			err := json.Unmarshal(data, &receivedConcepts)
-			if err != nil {
-				log.Printf("Error unmarshaling received concepts: %v", err)
-				continue
-			}
-
-			updateConceptList(receivedConcepts)
-			log.Printf("Received concept list with %d concepts", len(receivedConcepts))
+		case msg := <-ch:
+			handleReceivedMessage(msg)
 		}
 	}
 }
 
-func updateConceptList(newConcepts []ConcreteConcept) {
+func handleWebSocketConnection(c *gin.Context, sendFunc func(*websocket.Conn)) {
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade connection: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	log.Printf("New WebSocket connection established")
+
+	sendFunc(conn)
+
+	go periodicSend(conn, sendFunc)
+
+	keepAlive(conn)
+
+	log.Printf("WebSocket connection closed")
+}
+
+func periodicSend(conn *websocket.Conn, sendFunc func(*websocket.Conn)) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+		sendFunc(conn)
+	}
+}
+
+func keepAlive(conn *websocket.Conn) {
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			log.Printf("WebSocket read error: %v", err)
+			break
+		}
+	}
+}
+
+func sendConceptList(conn *websocket.Conn) {
+	sendJSONList(conn, conceptMap, &conceptMu, "concept map")
+}
+
+func sendPeerList(conn *websocket.Conn) {
+	peerMapMu.RLock()
+	defer peerMapMu.RUnlock()
+
+	filteredPeerMap := make(map[PeerID]Peer_i)
+	for peerID, peer := range peerMap {
+		if peer.GetOwnerGUID() != "" {
+			filteredPeerMap[peerID] = peer
+		}
+	}
+
+	if err := conn.WriteJSON(filteredPeerMap); err != nil {
+		log.Printf("Failed to send peer list: %v", err)
+	} else {
+		log.Printf("Sent filtered peer list with %d peers", len(filteredPeerMap))
+	}
+}
+
+func sendJSONList(conn *websocket.Conn, list interface{}, mu sync.Locker, itemType string) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if err := conn.WriteJSON(list); err != nil {
+		log.Printf("Failed to send %s: %v", itemType, err)
+	} else {
+		log.Printf("Sent %s", itemType)
+	}
+}
+
+func publishPeerMessage(ctx context.Context) {
+	peerID, err := ipfs.ID(ctx)
+	if err != nil {
+		log.Printf("Error getting peer ID: %v", err)
+		return
+	}
+
+	peerMapMu.RLock()
+	peer, exists := peerMap[peerID]
+	peerMapMu.RUnlock()
+
+	if !exists {
+		log.Printf("Peer information not set for this peer")
+		return
+	}
+
+	conceptMu.RLock()
+	cids := make([]CID, 0, len(conceptMap))
+	for _, concept := range conceptMap {
+		cids = append(cids, concept.GetCID())
+	}
+	conceptMu.RUnlock()
+
+	message := PeerMessage{
+		PeerID:    peerID,
+		OwnerGUID: peer.GetOwnerGUID(),
+		CIDs:      cids,
+	}
+
+	data, err := json.Marshal(message)
+	if err != nil {
+		log.Printf("Error marshaling peer message: %v", err)
+		return
+	}
+
+	if err := ipfs.Publish(ctx, pubsubTopic, data); err != nil {
+		log.Printf("Error publishing peer message: %v", err)
+	} else {
+		log.Printf("Published peer message with %d CIDs", len(cids))
+	}
+}
+
+func handleReceivedMessage(data []byte) {
+	var message PeerMessage
+	if err := json.Unmarshal(data, &message); err != nil {
+		log.Printf("Error unmarshaling received message: %v", err)
+		return
+	}
+
+	log.Printf("Received message from peer: %s", message.PeerID)
+
+	// Add or update the sender in the peer list
+	addOrUpdatePeer(message.PeerID, message.OwnerGUID)
+
+	// Update the CIDs for this peer
+	updatePeerCIDs(message.PeerID, message.CIDs)
+}
+
+func addOrUpdatePeer(peerID PeerID, ownerGUID GUID) {
+	peerMapMu.Lock()
+	defer peerMapMu.Unlock()
+
+	peerMap[peerID] = &Peer{
+		ID:        peerID,
+		OwnerGUID: ownerGUID,
+		Timestamp: time.Now(),
+	}
+	log.Printf("Updated peer: %s", peerID)
+
+	saveToIPFS(context.Background(), peerMap)
+}
+
+func updatePeerCIDs(peerID PeerID, cids []CID) {
 	conceptMu.Lock()
 	defer conceptMu.Unlock()
 
-	// This is a simple update mechanism. In a real-world scenario, you might want to
-	// implement a more sophisticated merging strategy.
-	for _, newConcept := range newConcepts {
+	for _, cid := range cids {
 		found := false
-		for i, existingConcept := range conceptList {
-			if existingConcept.GetGUID() == newConcept.GetGUID() {
-				conceptList[i] = &newConcept
+		for _, concept := range conceptMap {
+			if concept.GetCID() == cid {
 				found = true
 				break
 			}
 		}
 		if !found {
-			conceptList = append(conceptList, &newConcept)
+			// If the concept is not in our list, we might want to fetch it
+			// This is left as an exercise, as it depends on how you want to handle this case
+			log.Printf("Found new CID from peer %s: %s", peerID, cid)
 		}
 	}
 }
 
+func discoverPeers(ctx context.Context) {
+	peers, err := ipfs.ListPeers(ctx)
+	if err != nil {
+		log.Printf("Error discovering peers: %v", err)
+		return
+	}
+
+	peerMapMu.Lock()
+	defer peerMapMu.Unlock()
+
+	for _, peer := range peers {
+		peerID := peer.GetID()
+		if _, exists := peerMap[peerID]; !exists {
+			peerMap[peerID] = peer
+			log.Printf("Discovered new peer: %s", peerID)
+		}
+	}
+
+	log.Printf("Discovered %d peers", len(peerMap))
+
+	saveToIPFS(ctx, peerMap)
+}
+
 func addNewConcept(concept Concept_i) {
 	conceptMu.Lock()
-	conceptList = append(conceptList, concept)
+	conceptMap[concept.GetGUID()] = concept
 	conceptMu.Unlock()
 
-	log.Printf("Added new concept: %s", concept.GetGUID())
+	log.Printf("Added new concept: GUID=%s, Name=%s", concept.GetGUID(), concept.GetName())
 
-	// Trigger immediate publish
-	go publishConceptList(context.Background())
+	go publishPeerMessage(context.Background())
 }

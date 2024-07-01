@@ -29,6 +29,7 @@ type Concept_i interface {
 // Peer_i represents a peer in the network
 type Peer_i interface {
 	GetID() PeerID
+	GetOwnerGUID() GUID
 	GetCIDs() []CID
 	GetTimestamp() time.Time
 	AddCID(cid CID)
@@ -78,8 +79,8 @@ type Node_i interface {
 
 // Now let's define some concrete implementations of these interfaces
 
-// ConcreteConcept implements the Concept_i interface
-type ConcreteConcept struct {
+// Concept implements the Concept_i interface
+type Concept struct {
 	Guid        GUID
 	Name        string
 	Description string
@@ -89,26 +90,28 @@ type ConcreteConcept struct {
 	Timestamp   time.Time
 }
 
-func (c ConcreteConcept) GetGUID() GUID           { return c.Guid }
-func (c ConcreteConcept) GetName() string         { return c.Name }
-func (c ConcreteConcept) GetDescription() string  { return c.Description }
-func (c ConcreteConcept) GetType() string         { return c.Type }
-func (c ConcreteConcept) GetCID() CID             { return c.Cid }
-func (c ConcreteConcept) GetContent() string      { return c.Content }
-func (c ConcreteConcept) GetTimestamp() time.Time { return c.Timestamp }
+func (c Concept) GetGUID() GUID           { return c.Guid }
+func (c Concept) GetName() string         { return c.Name }
+func (c Concept) GetDescription() string  { return c.Description }
+func (c Concept) GetType() string         { return c.Type }
+func (c Concept) GetCID() CID             { return c.Cid }
+func (c Concept) GetContent() string      { return c.Content }
+func (c Concept) GetTimestamp() time.Time { return c.Timestamp }
 
 // ConcretePeer implements the Peer_i interface
-type ConcretePeer struct {
+type Peer struct {
 	ID        PeerID
+	OwnerGUID GUID
 	CIDs      []CID
 	Timestamp time.Time
 }
 
-func (p ConcretePeer) GetID() PeerID           { return p.ID }
-func (p ConcretePeer) GetCIDs() []CID          { return p.CIDs }
-func (p ConcretePeer) GetTimestamp() time.Time { return p.Timestamp }
-func (p *ConcretePeer) AddCID(cid CID)         { p.CIDs = append(p.CIDs, cid) }
-func (p *ConcretePeer) RemoveCID(cid CID) {
+func (p Peer) GetID() PeerID           { return p.ID }
+func (p Peer) GetOwnerGUID() GUID      { return p.OwnerGUID }
+func (p Peer) GetCIDs() []CID          { return p.CIDs }
+func (p Peer) GetTimestamp() time.Time { return p.Timestamp }
+func (p *Peer) AddCID(cid CID)         { p.CIDs = append(p.CIDs, cid) }
+func (p *Peer) RemoveCID(cid CID) {
 	for i, c := range p.CIDs {
 		if c == cid {
 			p.CIDs = append(p.CIDs[:i], p.CIDs[i+1:]...)

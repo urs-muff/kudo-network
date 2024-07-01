@@ -5,23 +5,14 @@ import { ListGroup } from 'react-bootstrap';
 const WS_URL = 'ws://localhost:9090/ws';
 
 function ConceptList() {
-  const [concepts, setConcepts] = useState([]);
+  const [concepts, setConcepts] = useState({});
 
   useEffect(() => {
     const ws = new WebSocket(WS_URL);
 
     ws.onmessage = (event) => {
-      const concept = JSON.parse(event.data);
-      setConcepts((prevConcepts) => {
-        const index = prevConcepts.findIndex((c) => c.Guid === concept.Guid);
-        if (index !== -1) {
-          const updatedConcepts = [...prevConcepts];
-          updatedConcepts[index] = concept;
-          return updatedConcepts;
-        } else {
-          return [...prevConcepts, concept];
-        }
-      });
+      const conceptMap = JSON.parse(event.data);
+      setConcepts(conceptMap);
     };
 
     return () => {
@@ -33,9 +24,10 @@ function ConceptList() {
     <div>
       <h2>Concepts</h2>
       <ListGroup>
-        {concepts.map((concept) => (
-          <ListGroup.Item key={concept.Guid}>
+        {Object.entries(concepts).map(([guid, concept]) => (
+          <ListGroup.Item key={guid}>
             <h5>{concept.Name}</h5>
+            <p><strong>GUID:</strong> {guid}</p>
             <p><strong>Type:</strong> {concept.Type}</p>
             <p><strong>Description:</strong> {concept.Description}</p>
             <p><strong>CID:</strong> {concept.Cid}</p>

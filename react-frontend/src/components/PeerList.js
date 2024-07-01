@@ -12,7 +12,7 @@ function PeerList() {
 
     ws.onmessage = (event) => {
       const peerData = JSON.parse(event.data);
-      setPeers(peerData ?? {});
+      setPeers(peerData);
     };
 
     return () => {
@@ -27,10 +27,11 @@ function PeerList() {
         {Object.entries(peers).map(([peerId, peerInfo]) => (
           <ListGroup.Item key={peerId}>
             <h5>Peer ID: {peerId}</h5>
+            <p><strong>Owner GUID:</strong> {peerInfo.OwnerGUID}</p>
             <p><strong>Last Updated:</strong> {new Date(peerInfo.Timestamp).toLocaleString()}</p>
             <p><strong>CIDs:</strong></p>
             <ul>
-              {peerInfo.CIDs.map((cid) => (
+              {peerInfo.CIDs && peerInfo.CIDs.map((cid) => (
                 <li key={cid}>{cid}</li>
               ))}
             </ul>
