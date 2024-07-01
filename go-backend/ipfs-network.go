@@ -22,9 +22,9 @@ const (
 	pubsubTopic       = "concept-list"
 	publishInterval   = 1 * time.Minute
 	peerCheckInterval = 5 * time.Minute
-	conceptListCID    = "concept-list-cid"
-	peerListCID       = "peer-list-cid"
-	ownerGUIDCID      = "owner-guid-cid"
+	conceptListPath   = "/ccn/concept-list.json"
+	peerListPath      = "/ccn/peer-list.json"
+	ownerGUIDPath     = "/ccn/owner-guid.json"
 )
 
 // IPFSShell implements the Node_i interface using go-ipfs-api
@@ -165,7 +165,6 @@ func main() {
 	defer cancel()
 
 	initializeLists(ctx)
-	loadOwnerGUID(ctx)
 
 	// Start IPFS routines
 	go runPeriodicTask(ctx, publishInterval, publishPeerMessage)
@@ -188,55 +187,33 @@ func initializeLists(ctx context.Context) {
 		log.Fatalf("Failed to bootstrap IPFS: %v", err)
 	}
 
-	loadFromIPFS(ctx, CID(conceptListCID), &conceptMap)
-	loadFromIPFS(ctx, CID(peerListCID), &peerMap)
+	if err := loadFromIPFS(ctx, conceptListPath, &conceptMap); err != nil {
+		log.Printf("Failed to load concept list: %v", err)
+	}
+	if err := loadFromIPFS(ctx, peerListPath, &peerMap); err != nil {
+		log.Printf("Failed to load peer list: %v", err)
+	}
+
+	loadOrCreateOwnerGUID(ctx)
 }
 
-func loadOwnerGUID(ctx context.Context) {
-	data, err := ipfs.Get(ctx, CID(ownerGUIDCID))
+func loadOrCreateOwnerGUID(ctx context.Context) {
+	var guid GUID
+	err := loadFromIPFS(ctx, ownerGUIDPath, &guid)
 	if err != nil {
 		log.Printf("Failed to load owner GUID from IPFS: %v", err)
 		log.Println("Generating new owner GUID...")
-		ownerMu.Lock()
-		ownerGUID = GUID(uuid.New().String())
-		ownerMu.Unlock()
-		if err := saveOwnerGUID(ctx); err != nil {
+		guid = GUID(uuid.New().String())
+		if err := saveToIPFS(ctx, ownerGUIDPath, guid); err != nil {
 			log.Printf("Failed to save new owner GUID: %v", err)
 		}
-		return
-	}
-	defer data.Close()
-
-	var guid GUID
-	if err := json.NewDecoder(data).Decode(&guid); err != nil {
-		log.Printf("Failed to decode owner GUID: %v", err)
-		return
 	}
 
 	ownerMu.Lock()
 	ownerGUID = guid
 	ownerMu.Unlock()
 
-	log.Printf("Loaded owner GUID from IPFS: %s", ownerGUID)
-}
-
-func saveOwnerGUID(ctx context.Context) error {
-	ownerMu.RLock()
-	guid := ownerGUID
-	ownerMu.RUnlock()
-
-	data, err := json.Marshal(guid)
-	if err != nil {
-		return fmt.Errorf("failed to marshal owner GUID: %v", err)
-	}
-
-	cid, err := ipfs.Add(ctx, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("failed to save owner GUID to IPFS: %v", err)
-	}
-
-	log.Printf("Saved owner GUID to IPFS with CID: %s", cid)
-	return nil
+	log.Printf("Owner GUID: %s", ownerGUID)
 }
 
 func setupRoutes(r *gin.Engine) {
@@ -265,35 +242,33 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
-func loadFromIPFS(ctx context.Context, cid CID, target interface{}) {
-	data, err := ipfs.Get(ctx, cid)
+func loadFromIPFS(ctx context.Context, path string, target interface{}) error {
+	data, err := ipfs.(*IPFSShell).sh.FilesRead(ctx, path)
 	if err != nil {
-		log.Printf("Failed to load data from IPFS (CID: %s): %v", cid, err)
-		return
+		return fmt.Errorf("failed to read file from IPFS: %v", err)
 	}
 	defer data.Close()
 
 	if err := json.NewDecoder(data).Decode(target); err != nil {
-		log.Printf("Failed to decode data from IPFS (CID: %s): %v", cid, err)
-		return
+		return fmt.Errorf("failed to decode data: %v", err)
 	}
 
-	log.Printf("Loaded data from IPFS (CID: %s)", cid)
+	log.Printf("Loaded data from IPFS path: %s", path)
+	return nil
 }
 
-func saveToIPFS(ctx context.Context, data interface{}) (CID, error) {
+func saveToIPFS(ctx context.Context, path string, data interface{}) error {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal data: %v", err)
+		return fmt.Errorf("failed to marshal data: %v", err)
 	}
 
-	cid, err := ipfs.Add(ctx, strings.NewReader(string(jsonData)))
-	if err != nil {
-		return "", fmt.Errorf("failed to save data to IPFS: %v", err)
+	if err := ipfs.(*IPFSShell).sh.FilesWrite(ctx, path, bytes.NewReader(jsonData), shell.FilesWrite.Create(true), shell.FilesWrite.Truncate(true), shell.FilesWrite.Parents(true)); err != nil {
+		return fmt.Errorf("failed to write file to IPFS: %v", err)
 	}
 
-	log.Printf("Saved data to IPFS with CID: %s", cid)
-	return cid, nil
+	log.Printf("Saved data to IPFS path: %s", path)
+	return nil
 }
 
 func runPeriodicTask(ctx context.Context, interval time.Duration, task func(context.Context)) {
@@ -339,7 +314,9 @@ func updateOwner(c *gin.Context) {
 	}
 	peerMapMu.Unlock()
 
-	saveToIPFS(context.Background(), peerMap)
+	if err := saveToIPFS(context.Background(), peerListPath, peerMap); err != nil {
+		log.Printf("Failed to save peerMap: %v", err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Owner updated successfully", "guid": ownerConcept.Guid})
 }
@@ -351,7 +328,9 @@ func addOrUpdateConcept(concept Concept_i) {
 	conceptMap[concept.GetGUID()] = concept
 	log.Printf("Added/Updated concept: GUID=%s, Name=%s", concept.GetGUID(), concept.GetName())
 
-	saveToIPFS(context.Background(), conceptMap)
+	if err := saveToIPFS(context.Background(), conceptListPath, conceptMap); err != nil {
+		log.Printf("Failed to save concept list: %v", err)
+	}
 }
 
 func getOwner(c *gin.Context) {
@@ -444,7 +423,9 @@ func deleteConcept(c *gin.Context) {
 	}
 
 	delete(conceptMap, guid)
-	saveToIPFS(context.Background(), conceptMap)
+	if err := saveToIPFS(context.Background(), conceptListPath, conceptMap); err != nil {
+		log.Printf("Failed to save concept list: %v", err)
+	}
 
 	c.Status(http.StatusNoContent)
 }
@@ -700,7 +681,9 @@ func addOrUpdatePeer(peerID PeerID, ownerGUID GUID) {
 	}
 	log.Printf("Updated peer: %s", peerID)
 
-	saveToIPFS(context.Background(), peerMap)
+	if err := saveToIPFS(context.Background(), peerListPath, peerMap); err != nil {
+		log.Printf("Failed to save peerMap: %v", err)
+	}
 }
 
 func updatePeerCIDs(peerID PeerID, cids []CID) {
@@ -743,7 +726,9 @@ func discoverPeers(ctx context.Context) {
 
 	log.Printf("Discovered %d peers", len(peerMap))
 
-	saveToIPFS(ctx, peerMap)
+	if err := saveToIPFS(context.Background(), peerListPath, peerMap); err != nil {
+		log.Printf("Failed to save peerMap: %v", err)
+	}
 }
 
 func addNewConcept(concept Concept_i) {
