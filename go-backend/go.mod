@@ -7,6 +7,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.1
 	github.com/ipfs/go-ipfs-api v0.7.0
+	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (
