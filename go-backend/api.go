@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"time"
 )
@@ -17,13 +18,15 @@ type GUID string
 
 // Concept_i represents a concept stored in the network
 type Concept_i interface {
+	GetCID() CID
+
 	GetGUID() GUID
 	GetName() string
 	GetDescription() string
 	GetType() string
-	GetCID() CID
-	GetContent() string
 	GetTimestamp() time.Time
+
+	Update(ctx context.Context) error
 }
 
 // Peer_i represents a peer in the network
@@ -50,6 +53,12 @@ type Network_i interface {
 	// List returns a list of all CIDs stored by this node
 	List(ctx context.Context) ([]CID, error)
 
+	// Load loads data from a given path in the network
+	Load(ctx context.Context, path string, target interface{}) error
+
+	// Save saves data to a given path in the network
+	Save(ctx context.Context, path string, data interface{}) error
+
 	// Publish publishes a message to a topic
 	Publish(ctx context.Context, topic string, data []byte) error
 
@@ -58,9 +67,6 @@ type Network_i interface {
 
 	// Connect connects to a peer
 	Connect(ctx context.Context, peerID PeerID) error
-
-	// Disconnect disconnects from a peer
-	Disconnect(ctx context.Context, peerID PeerID) error
 
 	// ListPeers returns a list of connected peers
 	ListPeers(ctx context.Context) ([]Peer_i, error)
@@ -81,41 +87,76 @@ type Node_i interface {
 
 // Concept implements the Concept_i interface
 type Concept struct {
-	Guid        GUID
+	CID         CID `json:"-"`
+	GUID        GUID
 	Name        string
 	Description string
 	Type        string
-	Cid         CID
-	Content     string
 	Timestamp   time.Time
 }
 
-func (c Concept) GetGUID() GUID           { return c.Guid }
+func (c Concept) GetCID() CID             { return c.CID }
+func (c Concept) GetGUID() GUID           { return c.GUID }
 func (c Concept) GetName() string         { return c.Name }
 func (c Concept) GetDescription() string  { return c.Description }
 func (c Concept) GetType() string         { return c.Type }
-func (c Concept) GetCID() CID             { return c.Cid }
-func (c Concept) GetContent() string      { return c.Content }
 func (c Concept) GetTimestamp() time.Time { return c.Timestamp }
 
 // ConcretePeer implements the Peer_i interface
 type Peer struct {
 	ID        PeerID
 	OwnerGUID GUID
-	CIDs      []CID
+	CIDs      map[CID]bool
 	Timestamp time.Time
 }
 
-func (p Peer) GetID() PeerID           { return p.ID }
-func (p Peer) GetOwnerGUID() GUID      { return p.OwnerGUID }
-func (p Peer) GetCIDs() []CID          { return p.CIDs }
-func (p Peer) GetTimestamp() time.Time { return p.Timestamp }
-func (p *Peer) AddCID(cid CID)         { p.CIDs = append(p.CIDs, cid) }
-func (p *Peer) RemoveCID(cid CID) {
-	for i, c := range p.CIDs {
-		if c == cid {
-			p.CIDs = append(p.CIDs[:i], p.CIDs[i+1:]...)
-			break
-		}
+func (p Peer) GetID() PeerID      { return p.ID }
+func (p Peer) GetOwnerGUID() GUID { return p.OwnerGUID }
+func (p Peer) GetCIDs() []CID {
+	ret := make([]CID, 0)
+	for cid := range p.CIDs {
+		ret = append(ret, cid)
 	}
+	return ret
+}
+func (p Peer) GetTimestamp() time.Time { return p.Timestamp }
+func (p *Peer) AddCID(cid CID)         { p.CIDs[cid] = true }
+func (p *Peer) RemoveCID(cid CID)      { delete(p.CIDs, cid) }
+
+func (p *Peer) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		ID        PeerID
+		OwnerGUID GUID
+		CIDs      []CID
+		Timestamp time.Time
+	}{
+		ID:        p.ID,
+		OwnerGUID: p.OwnerGUID,
+		CIDs:      p.GetCIDs(),
+		Timestamp: p.Timestamp,
+	})
+}
+
+func (p *Peer) UnmarshalJSON(data []byte) error {
+	var temp struct {
+		ID        PeerID    `json:"id"`
+		OwnerGUID GUID      `json:"ownerGuid"`
+		CIDs      []CID     `json:"cids"`
+		Timestamp time.Time `json:"timestamp"`
+	}
+
+	if err := json.Unmarshal(data, &temp); err != nil {
+		return err
+	}
+
+	p.ID = temp.ID
+	p.OwnerGUID = temp.OwnerGUID
+	p.Timestamp = temp.Timestamp
+	p.CIDs = make(map[CID]bool)
+
+	for _, cid := range temp.CIDs {
+		p.CIDs[cid] = true
+	}
+
+	return nil
 }
