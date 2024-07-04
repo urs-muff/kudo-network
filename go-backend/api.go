@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // CID represents a Content Identifier in IPFS
@@ -15,19 +17,6 @@ type PeerID string
 
 // GUID represents a globally unique identifier
 type GUID string
-
-// Concept_i represents a concept stored in the network
-type Concept_i interface {
-	GetCID() CID
-
-	GetGUID() GUID
-	GetName() string
-	GetDescription() string
-	GetType() string
-	GetTimestamp() time.Time
-
-	Update(ctx context.Context) error
-}
 
 // Peer_i represents a peer in the network
 type Peer_i interface {
@@ -87,12 +76,13 @@ type Node_i interface {
 
 // Concept implements the Concept_i interface
 type Concept struct {
-	CID         CID `json:"-"`
-	GUID        GUID
-	Name        string
-	Description string
-	Type        string
-	Timestamp   time.Time
+	CID           CID `json:"-"`
+	GUID          GUID
+	Name          string
+	Description   string
+	Type          string
+	Relationships []GUID // IDs of relationships this concept is involved in
+	Timestamp     time.Time
 }
 
 func (c Concept) GetCID() CID             { return c.CID }
@@ -101,6 +91,51 @@ func (c Concept) GetName() string         { return c.Name }
 func (c Concept) GetDescription() string  { return c.Description }
 func (c Concept) GetType() string         { return c.Type }
 func (c Concept) GetTimestamp() time.Time { return c.Timestamp }
+
+// Relationship represents a connection between two entities
+type Relationship struct {
+	ID              GUID
+	SourceID        GUID
+	TargetID        GUID
+	Type            GUID
+	EnergyFlow      float64
+	FrequencySpec   []float64
+	Amplitude       float64
+	Volume          float64
+	Depth           int
+	Interactions    int
+	LastInteraction time.Time
+	Timestamp       time.Time
+}
+
+// RelationshipMap stores all relationships
+type RelationshipMap map[GUID]*Relationship
+
+// Function to create a new relationship
+func CreateRelationship(sourceID, targetID GUID, relationType GUID) *Relationship {
+	return &Relationship{
+		ID:            GUID(uuid.New().String()),
+		SourceID:      sourceID,
+		TargetID:      targetID,
+		Type:          relationType,
+		EnergyFlow:    1.0, // Initial values, can be adjusted
+		FrequencySpec: []float64{1.0},
+		Amplitude:     1.0,
+		Volume:        1.0,
+		Depth:         1,
+		Interactions:  0,
+		Timestamp:     time.Now(),
+	}
+}
+
+// Function to update a relationship
+func (r *Relationship) Deepen() {
+	r.EnergyFlow *= 1.1
+	r.Amplitude *= 1.05
+	r.Volume *= 1.05
+	r.FrequencySpec = append(r.FrequencySpec, float64(len(r.FrequencySpec)+1))
+	r.Timestamp = time.Now()
+}
 
 // ConcretePeer implements the Peer_i interface
 type Peer struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -24,17 +25,20 @@ const (
 )
 
 type PeerMessage struct {
-	PeerID    PeerID `json:"peerId"`
-	OwnerGUID GUID   `json:"ownerGuid"`
-	CIDs      []CID  `json:"cids"`
+	PeerID        PeerID          `json:"peerId"`
+	OwnerGUID     GUID            `json:"ownerGuid"`
+	CIDs          []CID           `json:"cids"`
+	Relationships RelationshipMap `json:"relationships"`
 }
 
 var (
 	node Node_i
 
-	conceptMap map[GUID]Concept_i
+	conceptMap map[GUID]*Concept
 	GUID2CID   map[GUID]CID
 	conceptMu  sync.RWMutex
+
+	relationshipMap RelationshipMap
 
 	peerMap   PeerMap
 	peerMapMu sync.RWMutex
@@ -69,6 +73,23 @@ func (pm *PeerMap) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (rm *RelationshipMap) UnmarshalJSON(data []byte) error {
+	var rawMap map[PeerID]json.RawMessage
+	if err := json.Unmarshal(data, &rawMap); err != nil {
+		return err
+	}
+
+	*rm = make(RelationshipMap)
+	for guid, raw := range rawMap {
+		var r Relationship
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return err
+		}
+		(*rm)[GUID(guid)] = &r
+	}
+	return nil
+}
+
 func main() {
 	node = NewIPFSShell("localhost:5001")
 
@@ -76,6 +97,7 @@ func main() {
 	defer cancel()
 
 	initializeLists(ctx)
+	InitializeSystem(ctx)
 
 	// Start IPFS routines
 	go runPeriodicTask(ctx, publishInterval, publishPeerMessage)
@@ -91,9 +113,10 @@ func main() {
 }
 
 func initializeLists(ctx context.Context) {
-	conceptMap = make(map[GUID]Concept_i)
+	conceptMap = make(map[GUID]*Concept)
 	GUID2CID = make(map[GUID]CID)
 	peerMap = make(PeerMap)
+	relationshipMap = make(RelationshipMap)
 
 	if err := node.Bootstrap(ctx); err != nil {
 		log.Fatalf("Failed to bootstrap IPFS: %v", err)
@@ -107,6 +130,9 @@ func initializeLists(ctx context.Context) {
 
 	if err := node.Load(ctx, GUID2CIDPath, &GUID2CID); err != nil {
 		log.Printf("Failed to load concept list: %v\n", err)
+	}
+	if err := node.Load(ctx, "/ccn/relationships.json", &relationshipMap); err != nil {
+		log.Printf("Failed to load relationships: %v", err)
 	}
 	if err := node.Load(ctx, peerListPath, &peerMap); err != nil {
 		log.Printf("Failed to load peer list: %v\n", err)
@@ -158,17 +184,98 @@ func loadOrCreateOwner(ctx context.Context) {
 	log.Printf("Owner GUID: %s", ownerGUID)
 	cid, ok := GUID2CID[ownerGUID]
 	if !ok {
-		ownerConcept := Concept{
-			GUID:        guid,
-			Name:        "Owner",
-			Description: "Owner",
-			Type:        "Owner",
-			Timestamp:   time.Now(),
+		ownerConcept := &Concept{
+			GUID:          guid,
+			Name:          "Owner",
+			Description:   "Owner",
+			Type:          "Owner",
+			Timestamp:     time.Now(),
+			Relationships: []GUID{},
 		}
-		addOrUpdateConcept(context.Background(), &ownerConcept)
+		addOrUpdateConcept(context.Background(), ownerConcept)
 		cid = ownerConcept.CID
 	}
 	peerMap[peerID].AddCID(cid)
+}
+
+func addRelationship(c *gin.Context) {
+	var req struct {
+		SourceID GUID `json:"sourceId"`
+		TargetID GUID `json:"targetId"`
+		TypeID   GUID `json:"typeId"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	relationship := CreateRelationship(req.SourceID, req.TargetID, req.TypeID)
+	relationshipMap[relationship.ID] = relationship
+
+	// Update the concepts
+	conceptMu.Lock()
+	if concept, ok := conceptMap[req.SourceID]; ok {
+		concept.Relationships = append(concept.Relationships, relationship.ID)
+	}
+	if concept, ok := conceptMap[req.TargetID]; ok {
+		concept.Relationships = append(concept.Relationships, relationship.ID)
+	}
+	conceptMu.Unlock()
+
+	// Save updated data
+	saveRelationships(c.Request.Context())
+	saveConceptMap()
+
+	c.JSON(http.StatusOK, relationship)
+}
+
+func deepenRelationship(c *gin.Context) {
+	id := GUID(c.Param("id"))
+	if relationship, ok := relationshipMap[id]; ok {
+		relationship.Deepen()
+		relationshipMap[id] = relationship
+		saveRelationships(c.Request.Context())
+		c.JSON(http.StatusOK, relationship)
+	} else {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Relationship not found"})
+	}
+}
+
+func getRelationship(c *gin.Context) {
+	id := GUID(c.Param("id"))
+	if relationship, ok := relationshipMap[id]; ok {
+		c.JSON(http.StatusOK, relationship)
+	} else {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Relationship not found"})
+	}
+}
+
+func saveRelationships(ctx context.Context) error {
+	if err := node.Save(ctx, "/ccn/relationships.json", relationshipMap); err != nil {
+		log.Printf("Failed to save relationships: %v", err)
+		return err
+	}
+	return nil
+}
+
+func saveConceptMap() {
+	if err := node.Save(context.Background(), "/ccn/concepts.json", conceptMap); err != nil {
+		log.Printf("Failed to save concept map: %v", err)
+	}
+}
+
+func getRelationshipTypes(c *gin.Context) {
+	conceptMu.RLock()
+	defer conceptMu.RUnlock()
+
+	var relationshipTypes []Concept
+	for _, concept := range conceptMap {
+		if concept.Type == "RelationshipType" {
+			relationshipTypes = append(relationshipTypes, *concept)
+		}
+	}
+
+	c.JSON(http.StatusOK, relationshipTypes)
 }
 
 func setupRoutes(r *gin.Engine) {
@@ -182,6 +289,12 @@ func setupRoutes(r *gin.Engine) {
 	r.GET("/peers", listPeers)
 	r.GET("/ws", handleWebSocket)
 	r.GET("/ws/peers", handlePeerWebSocket)
+	r.POST("/relationship", addRelationship)
+	r.PUT("/relationship/:id/deepen", deepenRelationship)
+	r.GET("/relationship/:id", getRelationship)
+	r.GET("/relationship-types", getRelationshipTypes)
+	r.GET("/relationship-type/:type", getRelationshipsByType)
+	r.GET("/interact/:id", interactWithRelationship)
 }
 
 func corsMiddleware() gin.HandlerFunc {
@@ -243,12 +356,13 @@ func updateOwner(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Owner updated successfully", "guid": ownerConcept.GUID})
 }
 
-func addOrUpdateConcept(ctx context.Context, concept Concept_i) {
+func addOrUpdateConcept(ctx context.Context, concept *Concept) error {
 	conceptMu.Lock()
 	defer conceptMu.Unlock()
 
 	if err := concept.Update(context.Background()); err != nil {
 		log.Printf("Failed to update concept: %v", err)
+		return err
 	}
 	conceptMap[concept.GetGUID()] = concept
 	GUID2CID[concept.GetGUID()] = concept.GetCID()
@@ -256,7 +370,9 @@ func addOrUpdateConcept(ctx context.Context, concept Concept_i) {
 
 	if err := node.Save(ctx, GUID2CIDPath, GUID2CID); err != nil {
 		log.Printf("Failed to save concept list: %v", err)
+		return err
 	}
+	return nil
 }
 
 func getOwner(c *gin.Context) {
@@ -285,11 +401,12 @@ func addConcept(c *gin.Context) {
 	}
 
 	concept := &Concept{
-		GUID:        GUID(uuid.New().String()),
-		Name:        newConcept.Name,
-		Description: newConcept.Description,
-		Type:        newConcept.Type,
-		Timestamp:   time.Now(),
+		GUID:          GUID(uuid.New().String()),
+		Name:          newConcept.Name,
+		Description:   newConcept.Description,
+		Type:          newConcept.Type,
+		Timestamp:     time.Now(),
+		Relationships: []GUID{},
 	}
 	concept.Update(c.Request.Context())
 
@@ -391,22 +508,22 @@ type ConceptFilter struct {
 	TimestampAfter *time.Time
 }
 
-func filterConcepts(filter ConceptFilter) []Concept_i {
+func filterConcepts(filter ConceptFilter) []Concept {
 	conceptMu.RLock()
 	defer conceptMu.RUnlock()
 
 	if isEmptyFilter(filter) {
-		concepts := make([]Concept_i, 0, len(conceptMap))
+		concepts := make([]Concept, 0, len(conceptMap))
 		for _, concept := range conceptMap {
-			concepts = append(concepts, concept)
+			concepts = append(concepts, *concept)
 		}
 		return concepts
 	}
 
-	var filteredConcepts []Concept_i
+	var filteredConcepts []Concept
 	for _, concept := range conceptMap {
-		if matchesConcept(concept, filter) {
-			filteredConcepts = append(filteredConcepts, concept)
+		if matchesConcept(*concept, filter) {
+			filteredConcepts = append(filteredConcepts, *concept)
 		}
 	}
 	return filteredConcepts
@@ -417,7 +534,7 @@ func isEmptyFilter(filter ConceptFilter) bool {
 		filter.Description == "" && filter.Type == "" && filter.TimestampAfter == nil
 }
 
-func matchesConcept(concept Concept_i, filter ConceptFilter) bool {
+func matchesConcept(concept Concept, filter ConceptFilter) bool {
 	if filter.CID != "" && string(concept.GetCID()) != filter.CID {
 		return false
 	}
@@ -546,9 +663,10 @@ func publishPeerMessage(ctx context.Context) {
 	conceptMu.RUnlock()
 
 	message := PeerMessage{
-		PeerID:    peerID,
-		OwnerGUID: peer.GetOwnerGUID(),
-		CIDs:      cids,
+		PeerID:        peerID,
+		OwnerGUID:     peer.GetOwnerGUID(),
+		CIDs:          cids,
+		Relationships: relationshipMap,
 	}
 
 	data, err := json.Marshal(message)
@@ -575,6 +693,14 @@ func handleReceivedMessage(data []byte) {
 
 	// Add or update the sender in the peer list
 	addOrUpdatePeer(message.PeerID, message.OwnerGUID)
+
+	// Update local relationships with received ones
+	for id, relationship := range message.Relationships {
+		if _, exists := relationshipMap[id]; !exists {
+			relationshipMap[id] = relationship
+		}
+	}
+	saveRelationships(context.Background())
 
 	// Update the CIDs for this peer
 	updatePeerCIDs(message.PeerID, message.CIDs)
@@ -641,7 +767,7 @@ func discoverPeers(ctx context.Context) {
 	}
 }
 
-func addNewConcept(concept Concept_i) {
+func addNewConcept(concept *Concept) {
 	conceptMu.Lock()
 	conceptMap[concept.GetGUID()] = concept
 	GUID2CID[concept.GetGUID()] = concept.GetCID()
@@ -652,4 +778,70 @@ func addNewConcept(concept Concept_i) {
 	log.Printf("Added new concept: GUID=%s, CID=%s, Name=%s", concept.GetGUID(), concept.GetCID(), concept.GetName())
 
 	go publishPeerMessage(context.Background())
+}
+
+// Modify the Interact method of Relationship
+func (r *Relationship) Interact(interactionType GUID) {
+	r.Interactions++
+	r.Depth = int(math.Log2(float64(r.Interactions))) + 1
+	r.LastInteraction = time.Now()
+
+	// Get the interaction type concept
+	conceptMu.RLock()
+	interactionConcept, ok := conceptMap[interactionType]
+	conceptMu.RUnlock()
+
+	if !ok {
+		log.Printf("Interaction type %s not found", interactionType)
+		return
+	}
+
+	// Apply effects based on the interaction type
+	switch interactionConcept.Name {
+	case "Music":
+		r.FrequencySpec = append(r.FrequencySpec, 440.0) // Add A4 note
+		r.Amplitude *= 1.05
+	case "Meditation":
+		r.EnergyFlow *= 1.1
+		r.Volume *= 0.95
+	case "FlowState":
+		r.EnergyFlow *= 1.2
+		r.Amplitude *= 1.1
+		r.Volume *= 1.05
+	default:
+		r.EnergyFlow *= 1.05
+	}
+
+	r.Timestamp = time.Now()
+}
+
+// In ipfs-network.go, modify interactWithRelationship
+func interactWithRelationship(c *gin.Context) {
+	id := GUID(c.Param("id"))
+	var req struct {
+		InteractionTypeGUID GUID `json:"interactionTypeGuid"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	if relationship, ok := relationshipMap[id]; ok {
+		relationship.Interact(req.InteractionTypeGUID)
+		saveRelationships(c.Request.Context())
+		c.JSON(http.StatusOK, relationship)
+	} else {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Relationship not found"})
+	}
+}
+
+func getRelationshipsByType(c *gin.Context) {
+	typeGUID := GUID(c.Query("type"))
+	var filteredRelationships []*Relationship
+	for _, rel := range relationshipMap {
+		if rel.Type == typeGUID {
+			filteredRelationships = append(filteredRelationships, rel)
+		}
+	}
+	c.JSON(http.StatusOK, filteredRelationships)
 }
